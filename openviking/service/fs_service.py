@@ -1210,7 +1210,7 @@ class FSService:
             return
         if move:
             await versions.before_move(from_uri.rstrip("/"), to_uri.rstrip("/"), ctx)
-            await viking_fs._ensure_move_source_access(from_uri, ctx)
+            await viking_fs._ensure_removal_access(from_uri, ctx)
             await viking_fs._ensure_move_target_access(to_uri, ctx)
         else:
             await viking_fs._ensure_copy_source_access(from_uri, recursive=recursive, ctx=ctx)

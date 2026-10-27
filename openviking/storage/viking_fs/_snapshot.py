@@ -115,12 +115,8 @@ class _SnapshotMixin:
                 ctx,
                 action=AclAction.WRITE,
             )
-        if delete_targets:
-            await self._ensure_access_many(
-                list(dict.fromkeys(delete_targets)),
-                ctx,
-                action=AclAction.WRITE,
-            )
+        for uri in dict.fromkeys(delete_targets):
+            await self._ensure_removal_access(uri, ctx)  # type: ignore[attr-defined]
 
     @staticmethod
     def _restore_reindex_context(ctx: RequestContext) -> RequestContext:

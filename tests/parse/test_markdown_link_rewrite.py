@@ -3,13 +3,19 @@
 """Tests for MarkdownParser relative-link rewriting on ingest."""
 
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.directory import DirectoryParser
 from openviking.parse.parsers.markdown import MarkdownParser, _RewriteContext
+from openviking.server.identity import RequestContext, Role
+from openviking.storage.acl import AclAction, AclEntry, AclLevel, AclMode, DirectAcl, EffectiveAcl
+from openviking.storage.viking_fs import VikingFS
+from openviking_cli.session.user_id import UserIdentifier
 
 
 class TestRewriteRelativeLinks:
@@ -694,6 +700,49 @@ class TestImageLinkSplit:
         assert not any(u.endswith(".image_mappings.json") for u in fake.files), fake.files
 
 
+class _AclImageRewriteFS(FakeVikingFS):
+    """Keep the in-memory files while delegating permissions to the real kernel."""
+
+    def __init__(self, level):
+        super().__init__()
+        self.levels: dict[str, AclLevel] = {}
+        self.access_checks: list[tuple[str, RequestContext | None, AclAction]] = []
+        self.remove_calls: list[tuple[str, RequestContext | None, Any]] = []
+
+        async def resolve_many(uris, ctx):
+            return {
+                uri: EffectiveAcl(
+                    AclMode.RESTRICTED,
+                    DirectAcl((AclEntry("group:editors", self.levels.get(uri, level)),)),
+                    DirectAcl(),
+                )
+                for uri in uris
+            }
+
+        acl: Any = SimpleNamespace(
+            is_enabled=AsyncMock(return_value=True), resolve_many=resolve_many
+        )
+        self.permissions = VikingFS(agfs=SimpleNamespace(), acl_manager=acl)
+
+    async def _ensure_access(self, uri, ctx, *, action=AclAction.READ):
+        self.access_checks.append((uri, ctx, action))
+        await self.permissions._ensure_access(uri, ctx, action=action)
+
+    async def read_file(self, uri, **kwargs):
+        await self._ensure_access(uri, kwargs.get("ctx"))
+        return await super().read_file(uri, **kwargs)
+
+    async def write_file(self, uri, content, **kwargs):
+        await self._ensure_access(uri, kwargs.get("ctx"), action=AclAction.WRITE)
+        await super().write_file(uri, content, **kwargs)
+
+    async def rm(self, uri, **kwargs):
+        ctx = kwargs.get("ctx")
+        self.remove_calls.append((uri, ctx, kwargs.get("lease_ref")))
+        await self.permissions._ensure_removal_access(uri, ctx)
+        await super().rm(uri, **kwargs)
+
+
 class TestRewriteImageUris:
     """rewrite_image_uris must consume every .image_mappings.json in the tree,
     interpreting each one in the coordinate system of the directory holding it
@@ -703,6 +752,82 @@ class TestRewriteImageUris:
         import openviking.parse.image_rewrite as image_rewrite_mod
 
         return patch.object(image_rewrite_mod, "get_viking_fs", return_value=fake)
+
+    def _acl_files(self, level):
+        root = "viking://resources/doc"
+        fake = _AclImageRewriteFS(level)
+        fake.files = {
+            f"{root}/doc.md": b"![p](./assets/logo.png)",
+            f"{root}/logo.png": b"img",
+            f"{root}/.image_mappings.json": b'{"doc.md": {"./assets/logo.png": "logo.png"}}',
+        }
+        ctx = RequestContext(
+            user=UserIdentifier("account", "alice"),
+            role=Role(Role.USER),
+            group_ids=("editors",),
+            actor_peer_id="peer-a",
+            from_oauth=True,
+        )
+        return root, fake, ctx
+
+    async def test_writer_consumes_generated_sidecar_without_manage(self):
+        from openviking.parse.image_rewrite import rewrite_image_uris
+
+        root, fake, ctx = self._acl_files(AclLevel.WRITE)
+        mapping_uri = f"{root}/.image_mappings.json"
+        lease = {"lease_ref": "import-lease"}
+
+        with self._patched(fake):
+            stats = await rewrite_image_uris(root, ctx=ctx, lease_ref=lease)
+
+        assert stats == {"files_processed": 1, "references_rewritten": 1}
+        assert _decode(fake.files[f"{root}/doc.md"]) == f"![p]({root}/logo.png)"
+        assert mapping_uri not in fake.files
+        assert fake.files[f"{root}/logo.png"] == b"img"
+        assert (mapping_uri, ctx, AclAction.WRITE) in fake.access_checks
+        assert all(check_ctx is ctx for _, check_ctx, _ in fake.access_checks)
+        assert len(fake.remove_calls) == 1
+        removed_uri, cleanup_ctx, cleanup_lease = fake.remove_calls[0]
+        assert removed_uri == mapping_uri
+        assert cleanup_lease is lease
+        assert cleanup_ctx is not None
+        assert cleanup_ctx.bypass_acl
+        assert cleanup_ctx.user is ctx.user
+        assert cleanup_ctx.role == ctx.role
+        assert cleanup_ctx.group_ids == ctx.group_ids
+        assert cleanup_ctx.actor_peer_id == ctx.actor_peer_id
+        assert cleanup_ctx.from_oauth == ctx.from_oauth
+        assert not ctx.bypass_acl
+
+    async def test_reader_cannot_mutate_markdown_or_remove_generated_sidecar(self):
+        from openviking.parse.image_rewrite import rewrite_image_uris
+
+        root, fake, ctx = self._acl_files(AclLevel.READ)
+        before = dict(fake.files)
+
+        with self._patched(fake):
+            stats = await rewrite_image_uris(root, ctx=ctx)
+
+        assert stats == {"files_processed": 0, "references_rewritten": 0}
+        assert fake.files == before
+        assert not fake.remove_calls
+
+    async def test_cleanup_requires_write_on_exact_mapping_sidecar(self):
+        from openviking.parse.image_rewrite import rewrite_image_uris
+
+        root, fake, ctx = self._acl_files(AclLevel.WRITE)
+        mapping_uri = f"{root}/.image_mappings.json"
+        fake.levels[mapping_uri] = AclLevel.READ
+        mapping = fake.files[mapping_uri]
+
+        with self._patched(fake):
+            stats = await rewrite_image_uris(root, ctx=ctx)
+
+        assert stats == {"files_processed": 1, "references_rewritten": 1}
+        assert _decode(fake.files[f"{root}/doc.md"]) == f"![p]({root}/logo.png)"
+        assert fake.files[mapping_uri] == mapping
+        assert not fake.remove_calls
+        assert (mapping_uri, ctx, AclAction.WRITE) in fake.access_checks
 
     async def test_nested_mapping_consumed(self):
         from openviking.parse.image_rewrite import rewrite_image_uris

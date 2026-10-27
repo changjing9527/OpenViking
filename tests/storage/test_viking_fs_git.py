@@ -1,14 +1,88 @@
 # tests/storage/test_viking_fs_git.py
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
+
 import pytest
 
 from openviking.pyagfs.exceptions import AGFSNotFoundError, AGFSPathNotFoundError
 from openviking.server.identity import RequestContext, Role
 from openviking.storage import viking_fs as viking_fs_module
+from openviking.storage.acl import AclEntry, AclLevel, AclMode, DirectAcl, EffectiveAcl
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import PermissionDeniedError, ResourceExhaustedError
 from openviking_cli.session.user_id import UserIdentifier
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["preview", "apply"])
+@pytest.mark.parametrize(
+    "project_uri,acl_enabled,level,allowed",
+    [
+        ("viking://resources/project", True, AclLevel.WRITE, False),
+        ("viking://resources/project", True, AclLevel.MANAGE, True),
+        ("viking://resources/project", False, AclLevel.WRITE, True),
+        ("viking://user/user/resources/project", True, AclLevel.WRITE, True),
+    ],
+    ids=["shared-writer", "shared-manager", "acl-disabled", "private-writer"],
+)
+async def test_restore_resource_deletion_requires_manage(
+    monkeypatch, dry_run, project_uri, acl_enabled, level, allowed
+):
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="account", user_id="user"),
+        role=Role(Role.USER),
+    )
+    deleted_uri = f"{project_uri}/remove.md"
+    files = {deleted_uri: b"original content"}
+    plan = {"diff": {"to_write": [], "to_delete": ["remove.md"]}}
+
+    async def resolve_many(uris, request_ctx):
+        return {
+            uri: EffectiveAcl(
+                AclMode.RESTRICTED,
+                DirectAcl((AclEntry("user:user", level if uri == deleted_uri else AclLevel.READ),)),
+                DirectAcl(),
+            )
+            for uri in uris
+        }
+
+    async def native_restore(operation, **kwargs):
+        assert operation == "git_restore"
+        if kwargs["dry_run"]:
+            return plan
+        del files[deleted_uri]
+        return {"result": "applied", "deleted_paths": [deleted_uri.removeprefix("viking://")]}
+
+    agfs = SimpleNamespace(
+        run=AsyncMock(side_effect=native_restore),
+        pathlock_acquire_tree=AsyncMock(return_value={"lease_ref": "restore-lease"}),
+        pathlock_release=AsyncMock(),
+    )
+    acl: Any = SimpleNamespace(
+        is_enabled=AsyncMock(return_value=acl_enabled), resolve_many=resolve_many
+    )
+    fs = VikingFS(agfs=SimpleNamespace(), acl_manager=acl)
+    monkeypatch.setattr(fs, "_async_agfs", agfs)
+    monkeypatch.setattr(fs, "_schedule_restore_reindex_for_paths", AsyncMock(return_value=None))
+
+    if allowed:
+        result = await fs.restore(
+            project_dir=project_uri, source_commit="a" * 40, dry_run=dry_run, ctx=ctx
+        )
+        assert result == plan if dry_run else result["result"] == "applied"
+    else:
+        with pytest.raises(PermissionDeniedError, match="manage permission required"):
+            await fs.restore(
+                project_dir=project_uri, source_commit="a" * 40, dry_run=dry_run, ctx=ctx
+            )
+
+    applied_calls = [call for call in agfs.run.call_args_list if not call.kwargs["dry_run"]]
+    assert len(applied_calls) == int(allowed and not dry_run)
+    assert (deleted_uri in files) is (not allowed or dry_run)
+    assert agfs.pathlock_acquire_tree.await_count == int(not dry_run)
+    assert agfs.pathlock_release.await_count == int(not dry_run)
 
 
 async def test_show_without_limit_preserves_existing_binding_call():
@@ -308,9 +382,7 @@ async def test_diff_uses_bounded_native_diff_builder():
             {
                 "before": "old\n",
                 "after": "new\n",
-                "fromfile": (
-                    "viking://user/user/memories/experiences/example.md@from"
-                ),
+                "fromfile": ("viking://user/user/memories/experiences/example.md@from"),
                 "tofile": "viking://user/user/memories/experiences/example.md@to",
                 "timeout_ms": viking_fs_module.SNAPSHOT_DIFF_TIMEOUT_MS,
                 "max_output_bytes": viking_fs_module.SNAPSHOT_DIFF_MAX_OUTPUT_BYTES,

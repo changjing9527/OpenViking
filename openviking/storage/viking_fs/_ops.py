@@ -243,7 +243,7 @@ class _OpsMixin:
 
         guard_ctx = replace(self._ctx_or_default(ctx), bypass_acl=True)
         await self._ensure_access(uri, guard_ctx, action=AclAction.MANAGE)
-        await self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        await self._ensure_removal_access(uri, ctx)
         path = self._uri_to_path(uri, ctx=ctx)
         target_uri = self._path_to_uri(path, ctx=ctx)
 
@@ -262,6 +262,7 @@ class _OpsMixin:
 
         async def _finish_missing_delete() -> Dict[str, Any]:
             """Clean orphan index records for an idempotent delete."""
+            await self._ensure_removal_access(target_uri, ctx)
             if no_vector:
                 return {"estimated_deleted_count": 0}
             uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
@@ -310,6 +311,7 @@ class _OpsMixin:
                 raise ResourceBusyError(f"Resource is being processed: {uri}", uri=uri)
 
         try:
+            await self._ensure_removal_access(target_uri, ctx)
             if lease_ref is None and lease is not None:
                 try:
                     await self._async_agfs.stat(path)
@@ -387,14 +389,24 @@ class _OpsMixin:
         ``viking://upload`` — so cleanup avoids pointless ``delete_by_filter``
         round-trips. Despite the plural name it deletes a single URI (a file or,
         with ``recursive=True``, a directory subtree). URI safety and account
-        isolation are still enforced by ``_uri_to_path``; this method performs no
-        ACL checks, so callers must scope the URI themselves.
+        isolation are still enforced by ``_uri_to_path``. Shared resources with
+        ACL enabled use :meth:`rm` authorization, including descendant checks;
+        other callers must scope the URI themselves.
 
         ``auto_pathlock`` / ``lease_ref`` are forwarded to AGFS exactly like the
         underlying delete in :meth:`rm`. Callers that pass ``auto_pathlock=False``
         must guarantee the target is not concurrently mutated (best-effort
         cleanup of already-expired, uniquely-named upload directories).
         """
+        if is_acl_uri(uri) and await self._acl_enabled(ctx):  # type: ignore[attr-defined]
+            return await self.rm(
+                uri,
+                recursive=recursive,
+                ctx=ctx,
+                lease_ref=lease_ref,
+                auto_pathlock=auto_pathlock,
+                no_vector=True,
+            )
         path = self._uri_to_path(uri, ctx=ctx)
         return await self._async_agfs.rm(
             path,
@@ -559,7 +571,7 @@ class _OpsMixin:
                 if directory or source != old_uri:
                     await self._ensure_access(source, ctx, action=AclAction.MANAGE)
                 else:
-                    await self._ensure_move_source_access(source, ctx)
+                    await self._ensure_removal_access(source, ctx)
                 await self._ensure_move_target_access(target, ctx)
             else:
                 await self._ensure_copy_source_access(source, recursive=directory, ctx=ctx)
@@ -584,12 +596,12 @@ class _OpsMixin:
         await visit(old_uri, new_uri, is_dir)
         return source_uris
 
-    async def _ensure_move_source_access(
+    async def _ensure_removal_access(
         self,
         uri: str,
         ctx: Optional[RequestContext],
     ) -> None:
-        """Require manage for shared-resource moves when account ACL is enabled."""
+        """Require manage to delete or move shared resources when ACL is enabled."""
         action = (
             AclAction.MANAGE
             if is_acl_uri(uri) and await self._acl_enabled(ctx)
@@ -771,7 +783,7 @@ class _OpsMixin:
         acl_enabled = await self._acl_enabled(ctx)
         guard_ctx = replace(self._ctx_or_default(ctx), bypass_acl=True)
         await self._ensure_access(old_uri, guard_ctx, action=AclAction.MANAGE)
-        await self._ensure_move_source_access(old_uri, ctx)
+        await self._ensure_removal_access(old_uri, ctx)
         await self._ensure_move_target_access(new_uri, ctx)
         old_scope = old_uri.rstrip("/")
         new_scope = new_uri.rstrip("/")
@@ -2505,7 +2517,7 @@ class _OpsMixin:
         ctx: Optional[RequestContext] = None,
     ) -> None:
         """Move file."""
-        await self._ensure_move_source_access(from_uri, ctx)
+        await self._ensure_removal_access(from_uri, ctx)
         await self._ensure_move_target_access(to_uri, ctx)
         from_path = self._uri_to_path(from_uri, ctx=ctx)
         to_path = self._uri_to_path(to_uri, ctx=ctx)
@@ -2514,7 +2526,7 @@ class _OpsMixin:
             [{"path": from_path, "kind": "exact"}, {"path": to_path, "kind": "exact"}]
         )
         try:
-            await self._ensure_move_source_access(from_uri, ctx)
+            await self._ensure_removal_access(from_uri, ctx)
             await self._ensure_move_target_access(to_uri, ctx)
             content = await self.read_file_bytes(from_uri, ctx=ctx)
             await self.write_file_bytes(to_uri, content, ctx=ctx, lease_ref=lease)

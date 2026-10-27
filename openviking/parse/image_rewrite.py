@@ -10,10 +10,12 @@ images themselves are stored next to the markdown file referencing them).
 
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 from openviking.server.identity import RequestContext
+from openviking.storage.acl import AclAction
 from openviking.storage.viking_fs import get_viking_fs
 from openviking_cli.utils import get_logger
 
@@ -349,9 +351,16 @@ async def rewrite_image_uris(
     # Clean up mapping sidecars — no longer needed after rewrite
     for map_dir in mappings_by_dir:
         try:
+            mapping_uri = f"{map_dir}/{IMAGE_MAPPINGS_FILENAME}"
+            cleanup_ctx = ctx
+            if ctx is not None:
+                # Consuming generated import metadata remains part of writing
+                # the import, even when deleting user content requires manage.
+                await viking_fs._ensure_access(mapping_uri, ctx, action=AclAction.WRITE)
+                cleanup_ctx = replace(ctx, bypass_acl=True)
             await viking_fs.rm(
-                f"{map_dir}/{IMAGE_MAPPINGS_FILENAME}",
-                ctx=ctx,
+                mapping_uri,
+                ctx=cleanup_ctx,
                 lease_ref=lease_ref,
             )
         except Exception as e:
