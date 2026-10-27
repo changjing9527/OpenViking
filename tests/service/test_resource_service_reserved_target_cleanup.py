@@ -5,6 +5,7 @@ import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.resource_service import ResourceService
+from openviking.storage.acl import AclAction
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg, AddResourcePhase
 from openviking.storage.queuefs.add_resource_processor import AddResourceProcessor
 from openviking_cli.exceptions import FailedPreconditionError
@@ -35,7 +36,12 @@ async def test_cleanup_reserved_target_removes_only_empty_directory():
         exists=AsyncMock(return_value=True),
         stat=AsyncMock(return_value={"isDir": True}),
         ls=AsyncMock(return_value=[]),
-        rm=AsyncMock(),
+        _ensure_access=AsyncMock(),
+        _ensure_access_many=AsyncMock(),
+        _acl_enabled=AsyncMock(return_value=True),
+        _uri_to_path=lambda uri, ctx: "/account-1/resources/empty",
+        _collect_uris=AsyncMock(return_value=[]),
+        remove_files=AsyncMock(),
     )
     service = _service(viking_fs)
 
@@ -46,10 +52,17 @@ async def test_cleanup_reserved_target_removes_only_empty_directory():
     )
 
     assert removed is True
-    viking_fs.rm.assert_awaited_once_with(
+    viking_fs._ensure_access.assert_awaited_once_with(
+        "viking://resources/empty", ctx, action=AclAction.WRITE
+    )
+    cleanup_ctx = viking_fs.remove_files.call_args.kwargs["ctx"]
+    assert cleanup_ctx.bypass_acl is True
+    assert cleanup_ctx.user is ctx.user
+    assert ctx.bypass_acl is False
+    viking_fs.remove_files.assert_awaited_once_with(
         "viking://resources/empty",
         recursive=True,
-        ctx=ctx,
+        ctx=cleanup_ctx,
         lease_ref=lock,
     )
     viking_fs.stat.assert_awaited_once_with(
@@ -66,7 +79,7 @@ async def test_cleanup_reserved_target_preserves_nonempty_directory():
         exists=AsyncMock(return_value=True),
         stat=AsyncMock(return_value={"isDir": True}),
         ls=AsyncMock(return_value=[{"name": "document.md", "isDir": False}]),
-        rm=AsyncMock(),
+        remove_files=AsyncMock(),
     )
     service = _service(viking_fs)
 
@@ -77,7 +90,7 @@ async def test_cleanup_reserved_target_preserves_nonempty_directory():
     )
 
     assert removed is False
-    viking_fs.rm.assert_not_awaited()
+    viking_fs.remove_files.assert_not_awaited()
     viking_fs.stat.assert_awaited_once_with(
         "viking://resources/nonempty",
         ctx=ctx,

@@ -614,7 +614,7 @@ class _OpsMixin:
         uri: str,
         ctx: Optional[RequestContext],
     ) -> None:
-        """Authorize creation in a parent or replacement of an existing resource."""
+        """Require write on the destination and, for a new resource, its parent."""
         await self._ensure_access(uri, ctx, action=AclAction.WRITE)
         if not is_acl_uri(uri) or not await self._acl_enabled(ctx):
             return
@@ -629,8 +629,6 @@ class _OpsMixin:
             parent = VikingURI(uri).parent
             if parent is not None:
                 await self._ensure_access(parent.uri, ctx, action=AclAction.WRITE)
-        else:
-            await self._ensure_access(uri, ctx, action=AclAction.MANAGE)
 
     async def _ensure_copy_source_access(
         self,
