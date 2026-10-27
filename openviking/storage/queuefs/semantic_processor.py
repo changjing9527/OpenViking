@@ -42,7 +42,6 @@ from openviking.service.task_work_index import detach_task_context, get_task_con
 from openviking.storage.abstract_overview import (
     AbstractOverviewWriteResult,
     body_for_preview,
-    deterministic_sample,
     freshness_metadata,
     markdown_safe_viking_uri,
     parse_overview_file_summaries,
@@ -1072,15 +1071,9 @@ class SemanticProcessor(DequeueHandlerBase):
                 await asyncio.gather(*[_gen(i, fp) for i, fp in batch])
 
         completed_summaries = [s for s in file_summaries if s is not None]
-        sample_limit = getattr(
-            get_openviking_config().semantic,
-            "overview_sample_limit",
-            32,
-        )
-        sampled_summaries = deterministic_sample(completed_summaries, sample_limit)
         generated_content = await self._generate_overview(
             dir_uri,
-            sampled_summaries,
+            completed_summaries,
             [],
             llm_sem=llm_sem,
             total_files=len(file_paths),
@@ -1098,7 +1091,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 ctx=ctx,
                 lock=lock,
                 total_entries=len(file_paths),
-                sampled_entries=len(sampled_summaries),
+                sampled_entries=len(completed_summaries),
             )
         except LockAcquisitionError:
             raise
@@ -1519,7 +1512,9 @@ class SemanticProcessor(DequeueHandlerBase):
         """Enforce max size limits on overview and abstract."""
         semantic = get_openviking_config().semantic
         if len(overview) > semantic.overview_max_chars:
-            overview = self._truncate_generated_text(overview, semantic.overview_max_chars)
+            overview = self._truncate_generated_text(overview, semantic.overview_max_chars)[
+                : semantic.overview_max_chars
+            ]
         if len(abstract) > semantic.abstract_max_chars:
             abstract = self._truncate_generated_text(abstract, semantic.abstract_max_chars)
         return overview, abstract
@@ -1650,32 +1645,6 @@ class SemanticProcessor(DequeueHandlerBase):
                 directory_coverage=directory_coverage,
                 vlm=vlm,
             )
-        elif over_budget:
-            # Few files but long summaries → truncate summaries to fit budget
-            logger.info(
-                f"Overview prompt for {dir_uri} exceeds budget "
-                f"({estimated_size} chars) with {len(file_summaries)} files. "
-                f"Truncating summaries to fit."
-            )
-            budget = semantic.max_overview_prompt_chars
-            budget -= len(children_abstracts_str)
-            per_file = max(100, budget // max(len(file_summaries), 1))
-            truncated_lines = []
-            for idx, item in enumerate(file_summaries, 1):
-                summary = item["summary"][:per_file]
-                truncated_lines.append(
-                    f"- {item['name']} (link: viking://input_sample_f{idx}): {summary}"
-                )
-            file_summaries_str = "\n".join(truncated_lines)
-            overview = await self._single_generate_overview(
-                dir_uri,
-                file_summaries_str,
-                children_abstracts_str,
-                link_map,
-                output_language=output_language,
-                directory_coverage=directory_coverage,
-                vlm=vlm,
-            )
         else:
             overview = await self._single_generate_overview(
                 dir_uri,
@@ -1688,6 +1657,20 @@ class SemanticProcessor(DequeueHandlerBase):
             )
 
         return overview
+
+    def _render_overview_prompt(self, values: Dict[str, str]) -> str:
+        """Bound every L1 model input, including template text and merged partials."""
+        values = dict(values)
+        budget = get_openviking_config().semantic.max_overview_prompt_chars
+        while True:
+            prompt = render_prompt("semantic.overview_generation", values)
+            excess = len(prompt) - budget
+            if excess <= 0:
+                return prompt
+            field = max(("file_summaries", "children_abstracts"), key=lambda key: len(values[key]))
+            if not values[field]:
+                raise ValueError("Overview prompt budget is smaller than the prompt template")
+            values[field] = values[field][: max(0, len(values[field]) - excess)]
 
     async def _single_generate_overview(
         self,
@@ -1703,8 +1686,7 @@ class SemanticProcessor(DequeueHandlerBase):
         """Generate overview from a single prompt (small directories)."""
 
         try:
-            prompt = render_prompt(
-                "semantic.overview_generation",
+            prompt = self._render_overview_prompt(
                 {
                     "dir_name": dir_uri.split("/")[-1],
                     "file_summaries": file_summaries_str,
@@ -1779,8 +1761,7 @@ class SemanticProcessor(DequeueHandlerBase):
                         self._child_summary_line(dir_uri, global_idx, item, batch_link_map)
                     )
 
-            prompt = render_prompt(
-                "semantic.overview_generation",
+            prompt = self._render_overview_prompt(
                 {
                     "dir_name": dir_name,
                     "file_summaries": "\n".join(batch_lines) or "None",
@@ -1820,8 +1801,7 @@ class SemanticProcessor(DequeueHandlerBase):
         # with the complete map before persisting it.
         combined = "\n\n---\n\n".join(partial_overviews)
         try:
-            prompt = render_prompt(
-                "semantic.overview_generation",
+            prompt = self._render_overview_prompt(
                 {
                     "dir_name": dir_name,
                     "file_summaries": combined,
