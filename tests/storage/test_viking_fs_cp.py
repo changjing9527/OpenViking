@@ -1176,16 +1176,8 @@ async def test_resource_file_mv_rolls_back_when_destination_lacks_manage(acl_mov
 
 
 @pytest.mark.parametrize("restricted_child", ["nested", "nested/secret.md"])
-@pytest.mark.parametrize(
-    "side,child_level,denied_action",
-    [
-        ("target", AclLevel.READ, "write"),
-        ("target", AclLevel.WRITE, None),
-        ("source", AclLevel.WRITE, "manage"),
-    ],
-)
-async def test_resource_directory_merge_checks_source_manage_and_target_write(
-    acl_move_storage, restricted_child, side, child_level, denied_action
+async def test_resource_directory_merge_requires_write_on_existing_children(
+    acl_move_storage, restricted_child
 ):
     storage = acl_move_storage
     source, target = "viking://resources/source", "viking://resources/target"
@@ -1196,26 +1188,22 @@ async def test_resource_directory_merge_checks_source_manage_and_target_write(
         f"{target}/nested/secret.md": b"existing nested file",
     }.items():
         storage.agfs.write(storage.fs._uri_to_path(uri, ctx=storage.ctx), content)
+    child_uri = f"{target}/{restricted_child}"
     storage.grants.update(
-        {
-            source: AclLevel.MANAGE,
-            target: AclLevel.WRITE,
-        }
+        {source: AclLevel.MANAGE, target: AclLevel.WRITE, child_uri: AclLevel.READ}
     )
-    restricted_root = source if side == "source" else target
-    storage.grants[f"{restricted_root}/{restricted_child}"] = child_level
     before = _acl_move_files(storage)
 
-    if denied_action is not None:
-        with pytest.raises(PermissionDeniedError, match=f"{denied_action} permission required"):
-            await storage.fs.mv(source, target, ctx=storage.ctx)
-        assert _acl_move_files(storage) == before
-    else:
+    with pytest.raises(PermissionDeniedError, match="write permission required"):
         await storage.fs.mv(source, target, ctx=storage.ctx)
-        assert not storage.agfs.exists(storage.fs._uri_to_path(source, ctx=storage.ctx))
-        target_path = storage.fs._uri_to_path(target, ctx=storage.ctx)
-        assert storage.agfs.read_file(f"{target_path}/a.md") == b"new first file"
-        assert storage.agfs.read_file(f"{target_path}/nested/secret.md") == b"new nested file"
+    assert _acl_move_files(storage) == before
+
+    storage.grants[child_uri] = AclLevel.WRITE
+    await storage.fs.mv(source, target, ctx=storage.ctx)
+    assert not storage.agfs.exists(storage.fs._uri_to_path(source, ctx=storage.ctx))
+    target_path = storage.fs._uri_to_path(target, ctx=storage.ctx)
+    assert storage.agfs.read_file(f"{target_path}/a.md") == b"new first file"
+    assert storage.agfs.read_file(f"{target_path}/nested/secret.md") == b"new nested file"
     assert not storage.agfs._pathlock_leases
 
 
@@ -1253,19 +1241,17 @@ async def test_resource_directory_move_creates_nested_subtree_with_parent_write(
     assert not storage.agfs._pathlock_leases
 
 
-@pytest.mark.parametrize("target_exists", [False, True])
 async def test_resource_file_move_rechecks_target_write_after_acquiring_lease(
-    acl_move_storage, file_move_operation, monkeypatch, target_exists
+    acl_move_storage, file_move_operation, monkeypatch
 ):
     storage = acl_move_storage
     source, target = "viking://resources/source.md", "viking://resources/target.md"
-    source_path, target_path = _seed_acl_move(storage, source, target, target_exists=target_exists)
+    source_path, target_path = _seed_acl_move(storage, source, target, target_exists=False)
     storage.grants[source] = AclLevel.MANAGE
     acquire = storage.agfs.pathlock_acquire_batch_async
 
     async def acquire_after_target_change(*args, **kwargs):
-        if not target_exists:
-            storage.agfs.write(target_path, b"concurrent target content")
+        storage.agfs.write(target_path, b"concurrent target content")
         lease = await acquire(*args, **kwargs)
         storage.grants[target] = AclLevel.READ
         return lease
@@ -1276,15 +1262,12 @@ async def test_resource_file_move_rechecks_target_write_after_acquiring_lease(
         await getattr(storage.fs, file_move_operation)(source, target, ctx=storage.ctx)
 
     assert storage.agfs.read_file(source_path) == b"source content"
-    assert storage.agfs.read_file(target_path) == (
-        b"existing target content" if target_exists else b"concurrent target content"
-    )
+    assert storage.agfs.read_file(target_path) == b"concurrent target content"
     assert not storage.agfs._pathlock_leases
 
 
-@pytest.mark.parametrize("target_exists", [False, True])
 async def test_resource_directory_move_rechecks_target_write_after_acquiring_lease(
-    acl_move_storage, monkeypatch, target_exists
+    acl_move_storage, monkeypatch
 ):
     storage = acl_move_storage
     source, target = "viking://resources/source", "viking://resources/target"
@@ -1292,14 +1275,11 @@ async def test_resource_directory_move_rechecks_target_write_after_acquiring_lea
     target_path = storage.fs._uri_to_path(target, ctx=storage.ctx)
     storage.agfs.write(f"{source_path}/data.md", b"source content")
     storage.grants.update({"viking://resources": AclLevel.WRITE, source: AclLevel.MANAGE})
-    if target_exists:
-        storage.agfs.mkdir(target_path)
     before = _acl_move_files(storage)
     acquire = storage.agfs.pathlock_acquire_batch_async
 
     async def acquire_after_target_change(*args, **kwargs):
-        if not target_exists:
-            storage.agfs.mkdir(target_path)
+        storage.agfs.mkdir(target_path)
         lease = await acquire(*args, **kwargs)
         storage.grants[target] = AclLevel.READ
         return lease

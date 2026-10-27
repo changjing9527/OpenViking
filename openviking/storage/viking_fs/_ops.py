@@ -389,24 +389,14 @@ class _OpsMixin:
         ``viking://upload`` — so cleanup avoids pointless ``delete_by_filter``
         round-trips. Despite the plural name it deletes a single URI (a file or,
         with ``recursive=True``, a directory subtree). URI safety and account
-        isolation are still enforced by ``_uri_to_path``. Shared resources with
-        ACL enabled use :meth:`rm` authorization, including descendant checks;
-        other callers must scope the URI themselves.
+        isolation are still enforced by ``_uri_to_path``; this method performs no
+        ACL checks, so callers must scope the URI themselves.
 
         ``auto_pathlock`` / ``lease_ref`` are forwarded to AGFS exactly like the
         underlying delete in :meth:`rm`. Callers that pass ``auto_pathlock=False``
         must guarantee the target is not concurrently mutated (best-effort
         cleanup of already-expired, uniquely-named upload directories).
         """
-        if is_acl_uri(uri) and await self._acl_enabled(ctx):  # type: ignore[attr-defined]
-            return await self.rm(
-                uri,
-                recursive=recursive,
-                ctx=ctx,
-                lease_ref=lease_ref,
-                auto_pathlock=auto_pathlock,
-                no_vector=True,
-            )
         path = self._uri_to_path(uri, ctx=ctx)
         return await self._async_agfs.rm(
             path,

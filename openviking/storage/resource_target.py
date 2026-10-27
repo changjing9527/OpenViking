@@ -13,10 +13,8 @@ both first-import (full upload) and incremental (diff subset) via one channel.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any, Optional
 
-from openviking.server.identity import RequestContext
 from openviking.storage.acl import AclAction, is_acl_uri
 from openviking.utils.path_safety import safe_join_viking_uri
 
@@ -29,7 +27,7 @@ class AgfsResourceTarget:
         *,
         viking_fs: Any,
         root_uri: str,
-        ctx: RequestContext,
+        ctx: Any,
         lease_ref: Optional[dict] = None,
     ) -> None:
         self._viking_fs = viking_fs
@@ -73,12 +71,10 @@ class AgfsResourceTarget:
             await self._viking_fs._ensure_access_many(
                 [uri, *descendants], self._ctx, action=AclAction.WRITE
             )
-        # This is replacement/synchronization inside an authorized import, not
-        # a public delete. Keep caller identity and namespace checks intact.
         await self._viking_fs.remove_files(
             uri,
             recursive=is_dir,
-            ctx=replace(self._ctx, bypass_acl=True),
+            ctx=self._ctx,
             lease_ref=self._lease_ref,
         )
 

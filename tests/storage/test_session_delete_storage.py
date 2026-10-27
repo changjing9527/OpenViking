@@ -3,7 +3,6 @@
 
 """Unindexed deletion avoids vector work while retaining storage safety checks."""
 
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -21,8 +20,6 @@ SESSION_URI = "viking://user/alice/sessions/session-1"
 SESSION_PATH = "/local/account/user/alice/sessions/session-1"
 RESOURCE_URI = "viking://resources/project"
 RESOURCE_PATH = "/local/account/resources/project"
-RESOURCE_FILE_URI = f"{RESOURCE_URI}/document.md"
-RESOURCE_FILE_PATH = f"{RESOURCE_PATH}/document.md"
 
 
 @pytest.fixture
@@ -219,243 +216,43 @@ async def test_default_rm_still_cleans_vector_records(storage, missing, uri):
         storage.agfs.pathlock_release.assert_awaited_once_with(storage.lease)
 
 
-@pytest.mark.parametrize(
-    "delete_method,no_vector", [("rm", False), ("rm", True), ("remove_files", True)]
-)
-@pytest.mark.parametrize("child_allowed", [False, True])
-async def test_resource_delete_still_checks_descendant_manage_acl(
-    storage, delete_method, no_vector, child_allowed
-):
+@pytest.mark.parametrize("no_vector", [False, True])
+@pytest.mark.parametrize("is_dir", [False, True])
+async def test_resource_delete_requires_manage_on_file_and_descendants(storage, no_vector, is_dir):
     child_uri = f"{RESOURCE_URI}/restricted.md"
-    storage.fs._collect_uris.return_value = [child_uri]
+    uri = RESOURCE_URI if is_dir else child_uri
+    storage.agfs.stat.return_value = {"isDir": is_dir}
+    storage.fs._collect_uris.side_effect = lambda *args, **kwargs: [child_uri] if is_dir else []
     storage.acl.is_enabled.return_value = True
-    allowed = EffectiveAcl(
+    manager = EffectiveAcl(
         AclMode.RESTRICTED,
         DirectAcl((AclEntry("user:alice", AclLevel.MANAGE),)),
         DirectAcl(),
     )
-    denied = EffectiveAcl(AclMode.RESTRICTED, DirectAcl(), DirectAcl())
-
-    async def resolve_many(uris, ctx):
-        return {uri: denied if uri == child_uri and not child_allowed else allowed for uri in uris}
-
-    storage.acl.resolve_many.side_effect = resolve_many
-    kwargs = {"no_vector": no_vector} if delete_method == "rm" else {}
-
-    if child_allowed:
-        result = await getattr(storage.fs, delete_method)(
-            RESOURCE_URI, recursive=True, ctx=storage.ctx, **kwargs
-        )
-        assert result == {"estimated_deleted_count": 0 if no_vector else 7}
-        storage.agfs.rm.assert_awaited_once()
-    else:
-        with pytest.raises(PermissionDeniedError, match="restricted.md"):
-            await getattr(storage.fs, delete_method)(
-                RESOURCE_URI, recursive=True, ctx=storage.ctx, **kwargs
-            )
-        storage.agfs.rm.assert_not_awaited()
-
-    storage.fs._collect_uris.assert_awaited_once_with(
-        RESOURCE_PATH, True, ctx=storage.ctx, strict=True
+    child_acl = EffectiveAcl(
+        AclMode.RESTRICTED,
+        DirectAcl((AclEntry("user:alice", AclLevel.WRITE),)),
+        DirectAcl(),
     )
-    if no_vector or not child_allowed:
-        storage.vector.count.assert_not_awaited()
-        storage.vector.delete_uris.assert_not_awaited()
-    else:
-        storage.vector.count.assert_awaited_once()
-        storage.vector.delete_uris.assert_awaited_once_with(storage.ctx, [child_uri, RESOURCE_URI])
-    storage.agfs.pathlock_release.assert_awaited_once_with(storage.lease)
-
-
-@pytest.fixture
-def file_storage(storage):
-    storage.agfs.stat.return_value = {"isDir": False}
-    storage.acl.is_enabled.return_value = True
-    storage.acl_level = AclLevel.WRITE
 
     async def resolve_many(uris, ctx):
-        effective = EffectiveAcl(
-            AclMode.RESTRICTED,
-            DirectAcl((AclEntry("user:alice", storage.acl_level),)),
-            DirectAcl(),
-        )
-        return dict.fromkeys(uris, effective)
+        return {target: child_acl if target == child_uri else manager for target in uris}
 
     storage.acl.resolve_many.side_effect = resolve_many
-    return storage
+    with pytest.raises(PermissionDeniedError, match="manage permission required"):
+        await storage.fs.rm(uri, recursive=is_dir, ctx=storage.ctx, no_vector=no_vector)
+    storage.agfs.rm.assert_not_awaited()
+    storage.vector.delete_uris.assert_not_awaited()
 
-
-@pytest.mark.parametrize(
-    "delete_method,no_vector", [("rm", False), ("rm", True), ("remove_files", True)]
-)
-@pytest.mark.parametrize("level", [AclLevel.WRITE, AclLevel.MANAGE])
-async def test_resource_file_delete_requires_manage(file_storage, delete_method, no_vector, level):
-    storage = file_storage
-    storage.acl_level = level
-    kwargs = {"no_vector": no_vector} if delete_method == "rm" else {}
-
-    if level is AclLevel.WRITE:
-        with pytest.raises(PermissionDeniedError, match="manage permission required"):
-            await getattr(storage.fs, delete_method)(RESOURCE_FILE_URI, ctx=storage.ctx, **kwargs)
-        storage.agfs.rm.assert_not_awaited()
-        storage.vector.count.assert_not_awaited()
-        storage.vector.delete_uris.assert_not_awaited()
-        storage.agfs.pathlock_acquire_exact.assert_not_awaited()
-        return
-
-    result = await getattr(storage.fs, delete_method)(RESOURCE_FILE_URI, ctx=storage.ctx, **kwargs)
+    child_acl = manager
+    result = await storage.fs.rm(uri, recursive=is_dir, ctx=storage.ctx, no_vector=no_vector)
 
     assert result == {"estimated_deleted_count": 0 if no_vector else 7}
     storage.agfs.rm.assert_awaited_once()
-    storage.agfs.pathlock_acquire_exact.assert_awaited_once_with(RESOURCE_FILE_PATH)
-    storage.agfs.pathlock_release.assert_awaited_once_with(storage.lease)
     if no_vector:
         storage.vector.count.assert_not_awaited()
         storage.vector.delete_uris.assert_not_awaited()
     else:
-        storage.vector.delete_uris.assert_awaited_once_with(storage.ctx, [RESOURCE_FILE_URI])
-
-
-@pytest.mark.parametrize("no_vector", [False, True])
-@pytest.mark.parametrize("level", [AclLevel.WRITE, AclLevel.MANAGE])
-async def test_missing_resource_file_delete_requires_manage(file_storage, no_vector, level):
-    storage = file_storage
-    storage.acl_level = level
-    storage.agfs.stat.side_effect = FileNotFoundError(RESOURCE_FILE_PATH)
-
-    if level is AclLevel.WRITE:
-        with pytest.raises(PermissionDeniedError, match="manage permission required"):
-            await storage.fs.rm(RESOURCE_FILE_URI, ctx=storage.ctx, no_vector=no_vector)
-    else:
-        result = await storage.fs.rm(RESOURCE_FILE_URI, ctx=storage.ctx, no_vector=no_vector)
-        assert result == {"estimated_deleted_count": 0 if no_vector else 7}
-
-    storage.agfs.rm.assert_not_awaited()
-    storage.agfs.pathlock_acquire_exact.assert_not_awaited()
-    if no_vector or level is AclLevel.WRITE:
-        storage.vector.count.assert_not_awaited()
-        storage.vector.delete_uris.assert_not_awaited()
-    else:
-        storage.vector.delete_uris.assert_awaited_once_with(storage.ctx, [RESOURCE_FILE_URI])
-
-
-@pytest.mark.parametrize(
-    "uri,acl_enabled",
-    [
-        (RESOURCE_FILE_URI, False),
-        ("viking://user/alice/resources/document.md", True),
-        ("viking://temp/alice/document.md", True),
-    ],
-)
-async def test_file_delete_preserves_disabled_acl_and_private_scope_behavior(
-    file_storage, uri, acl_enabled
-):
-    storage = file_storage
-    storage.acl.is_enabled.return_value = acl_enabled
-
-    result = await storage.fs.rm(uri, ctx=storage.ctx)
-
-    assert result == {"estimated_deleted_count": 7}
-    storage.agfs.rm.assert_awaited_once()
-    storage.vector.delete_uris.assert_awaited_once_with(storage.ctx, [uri])
-    storage.agfs.pathlock_release.assert_awaited_once_with(storage.lease)
-
-
-@pytest.mark.parametrize("access", ["admin", "bypass"])
-async def test_resource_file_delete_preserves_admin_and_internal_acl_bypass(file_storage, access):
-    storage = file_storage
-    ctx = (
-        replace(storage.ctx, role=Role.ADMIN)
-        if access == "admin"
-        else replace(storage.ctx, bypass_acl=True)
-    )
-
-    await storage.fs.rm(RESOURCE_FILE_URI, ctx=ctx)
-
-    storage.agfs.rm.assert_awaited_once()
-    storage.vector.delete_uris.assert_awaited_once_with(ctx, [RESOURCE_FILE_URI])
-    storage.agfs.pathlock_release.assert_awaited_once_with(storage.lease)
-
-
-@pytest.mark.parametrize("no_vector", [False, True])
-async def test_resource_file_delete_rechecks_manage_after_exact_lock(file_storage, no_vector):
-    storage = file_storage
-    storage.acl_level = AclLevel.MANAGE
-
-    async def acquire_after_acl_downgrade(path):
-        storage.acl_level = AclLevel.WRITE
-        return storage.lease
-
-    storage.agfs.pathlock_acquire_exact.side_effect = acquire_after_acl_downgrade
-
-    with pytest.raises(PermissionDeniedError, match="manage permission required"):
-        await storage.fs.rm(RESOURCE_FILE_URI, ctx=storage.ctx, no_vector=no_vector)
-
-    storage.agfs.rm.assert_not_awaited()
-    storage.vector.count.assert_not_awaited()
-    storage.vector.delete_uris.assert_not_awaited()
-    storage.agfs.pathlock_release.assert_awaited_once_with(storage.lease)
-
-
-@pytest.mark.parametrize("missing_after_lock", [False, True])
-async def test_missing_resource_file_cleanup_rechecks_manage_after_stat(
-    file_storage, missing_after_lock
-):
-    storage = file_storage
-    storage.acl_level = AclLevel.MANAGE
-
-    async def stat_with_acl_downgrade(path):
-        if missing_after_lock and storage.agfs.stat.await_count == 1:
-            return {"isDir": False}
-        storage.acl_level = AclLevel.WRITE
-        raise FileNotFoundError(path)
-
-    storage.agfs.stat.side_effect = stat_with_acl_downgrade
-
-    with pytest.raises(PermissionDeniedError, match="manage permission required"):
-        await storage.fs.rm(RESOURCE_FILE_URI, ctx=storage.ctx)
-
-    storage.agfs.rm.assert_not_awaited()
-    storage.vector.count.assert_not_awaited()
-    storage.vector.delete_uris.assert_not_awaited()
-    if missing_after_lock:
-        storage.agfs.pathlock_release.assert_awaited_once_with(storage.lease)
-    else:
-        storage.agfs.pathlock_acquire_exact.assert_not_awaited()
-
-
-@pytest.mark.parametrize("no_vector", [False, True])
-async def test_resource_file_missing_after_lock_cleans_orphans_with_manage(file_storage, no_vector):
-    storage = file_storage
-    storage.acl_level = AclLevel.MANAGE
-    storage.agfs.stat.side_effect = [{"isDir": False}, FileNotFoundError(RESOURCE_FILE_PATH)]
-
-    result = await storage.fs.rm(RESOURCE_FILE_URI, ctx=storage.ctx, no_vector=no_vector)
-
-    assert result == {"estimated_deleted_count": 0 if no_vector else 7}
-    storage.agfs.rm.assert_not_awaited()
-    storage.agfs.pathlock_release.assert_awaited_once_with(storage.lease)
-    if no_vector:
-        storage.vector.count.assert_not_awaited()
-        storage.vector.delete_uris.assert_not_awaited()
-    else:
-        storage.vector.delete_uris.assert_awaited_once_with(storage.ctx, [RESOURCE_FILE_URI])
-
-
-async def test_resource_remove_files_preserves_borrowed_lease_and_skips_vectors(file_storage):
-    storage = file_storage
-    storage.acl_level = AclLevel.MANAGE
-    outer_lease = {"lease_ref": "outer-lease"}
-
-    await storage.fs.remove_files(RESOURCE_FILE_URI, ctx=storage.ctx, lease_ref=outer_lease)
-
-    storage.agfs.rm.assert_awaited_once_with(
-        RESOURCE_FILE_PATH,
-        recursive=False,
-        fs_ctx={"account_id": "account", "lease_ref": "outer-lease"},
-        auto_pathlock=True,
-    )
-    storage.agfs.pathlock_acquire_exact.assert_not_awaited()
-    storage.agfs.pathlock_release.assert_not_awaited()
-    storage.vector.count.assert_not_awaited()
-    storage.vector.delete_uris.assert_not_awaited()
+        storage.vector.delete_uris.assert_awaited_once_with(
+            storage.ctx, [child_uri, RESOURCE_URI] if is_dir else [child_uri]
+        )

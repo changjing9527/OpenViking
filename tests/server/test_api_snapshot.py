@@ -268,6 +268,12 @@ async def test_restore_acl_and_reindex_identity(client_with_resource, service, m
             dry_run=True,
             ctx=writer,
         )
+    with pytest.raises(PermissionDeniedError, match="manage permission required"):
+        await service.fs.restore(
+            project_dir=root,
+            source_commit=v1["commit_oid"],
+            ctx=writer,
+        )
     assert await service.fs.read(extra_uri, ctx=writer) == "remove"
     await service.fs.grant_acl(
         extra_uri, principal="user:snapshot_writer", level="manage", ctx=admin

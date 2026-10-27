@@ -10,7 +10,6 @@ images themselves are stored next to the markdown file referencing them).
 
 import json
 import re
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
@@ -352,15 +351,13 @@ async def rewrite_image_uris(
     for map_dir in mappings_by_dir:
         try:
             mapping_uri = f"{map_dir}/{IMAGE_MAPPINGS_FILENAME}"
-            cleanup_ctx = ctx
             if ctx is not None:
                 # Consuming generated import metadata remains part of writing
                 # the import, even when deleting user content requires manage.
                 await viking_fs._ensure_access(mapping_uri, ctx, action=AclAction.WRITE)
-                cleanup_ctx = replace(ctx, bypass_acl=True)
-            await viking_fs.rm(
+            await viking_fs.remove_files(
                 mapping_uri,
-                ctx=cleanup_ctx,
+                ctx=ctx,
                 lease_ref=lease_ref,
             )
         except Exception as e:

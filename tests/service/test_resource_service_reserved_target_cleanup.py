@@ -55,14 +55,10 @@ async def test_cleanup_reserved_target_removes_only_empty_directory():
     viking_fs._ensure_access.assert_awaited_once_with(
         "viking://resources/empty", ctx, action=AclAction.WRITE
     )
-    cleanup_ctx = viking_fs.remove_files.call_args.kwargs["ctx"]
-    assert cleanup_ctx.bypass_acl is True
-    assert cleanup_ctx.user is ctx.user
-    assert ctx.bypass_acl is False
     viking_fs.remove_files.assert_awaited_once_with(
         "viking://resources/empty",
         recursive=True,
-        ctx=cleanup_ctx,
+        ctx=ctx,
         lease_ref=lock,
     )
     viking_fs.stat.assert_awaited_once_with(
