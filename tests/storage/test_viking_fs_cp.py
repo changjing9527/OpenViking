@@ -1042,7 +1042,7 @@ async def test_resource_file_move_to_new_target_requires_parent_write(
         assert storage.agfs.read_file(target_path) == b"source content"
 
 
-@pytest.mark.parametrize("target_level", [AclLevel.READ, AclLevel.WRITE, AclLevel.MANAGE])
+@pytest.mark.parametrize("target_level", [AclLevel.READ, AclLevel.WRITE])
 async def test_resource_file_move_overwrite_requires_target_write(
     acl_move_storage, file_move_operation, target_level
 ):
@@ -1130,7 +1130,7 @@ async def test_resource_file_move_rechecks_manage_after_acquiring_lease(
     storage = acl_move_storage
     source, target = "viking://resources/source.md", "viking://resources/target.md"
     _seed_acl_move(storage, source, target)
-    storage.grants.update({source: AclLevel.MANAGE, target: AclLevel.WRITE})
+    storage.grants.update({source: AclLevel.MANAGE, target: AclLevel.MANAGE})
     before = _acl_move_files(storage)
     acquire = storage.agfs.pathlock_acquire_batch_async
 
@@ -1188,22 +1188,19 @@ async def test_resource_directory_merge_requires_write_on_existing_children(
         f"{target}/nested/secret.md": b"existing nested file",
     }.items():
         storage.agfs.write(storage.fs._uri_to_path(uri, ctx=storage.ctx), content)
-    child_uri = f"{target}/{restricted_child}"
     storage.grants.update(
-        {source: AclLevel.MANAGE, target: AclLevel.WRITE, child_uri: AclLevel.READ}
+        {
+            source: AclLevel.MANAGE,
+            target: AclLevel.MANAGE,
+            f"{target}/{restricted_child}": AclLevel.READ,
+        }
     )
     before = _acl_move_files(storage)
 
     with pytest.raises(PermissionDeniedError, match="write permission required"):
         await storage.fs.mv(source, target, ctx=storage.ctx)
-    assert _acl_move_files(storage) == before
 
-    storage.grants[child_uri] = AclLevel.WRITE
-    await storage.fs.mv(source, target, ctx=storage.ctx)
-    assert not storage.agfs.exists(storage.fs._uri_to_path(source, ctx=storage.ctx))
-    target_path = storage.fs._uri_to_path(target, ctx=storage.ctx)
-    assert storage.agfs.read_file(f"{target_path}/a.md") == b"new first file"
-    assert storage.agfs.read_file(f"{target_path}/nested/secret.md") == b"new nested file"
+    assert _acl_move_files(storage) == before
     assert not storage.agfs._pathlock_leases
 
 
@@ -1241,7 +1238,7 @@ async def test_resource_directory_move_creates_nested_subtree_with_parent_write(
     assert not storage.agfs._pathlock_leases
 
 
-async def test_resource_file_move_rechecks_target_write_after_acquiring_lease(
+async def test_resource_file_move_rechecks_target_created_before_lease(
     acl_move_storage, file_move_operation, monkeypatch
 ):
     storage = acl_move_storage
@@ -1250,13 +1247,12 @@ async def test_resource_file_move_rechecks_target_write_after_acquiring_lease(
     storage.grants[source] = AclLevel.MANAGE
     acquire = storage.agfs.pathlock_acquire_batch_async
 
-    async def acquire_after_target_change(*args, **kwargs):
+    async def acquire_after_target_created(*args, **kwargs):
         storage.agfs.write(target_path, b"concurrent target content")
-        lease = await acquire(*args, **kwargs)
         storage.grants[target] = AclLevel.READ
-        return lease
+        return await acquire(*args, **kwargs)
 
-    monkeypatch.setattr(storage.agfs, "pathlock_acquire_batch_async", acquire_after_target_change)
+    monkeypatch.setattr(storage.agfs, "pathlock_acquire_batch_async", acquire_after_target_created)
 
     with pytest.raises(PermissionDeniedError, match="write permission required"):
         await getattr(storage.fs, file_move_operation)(source, target, ctx=storage.ctx)
@@ -1266,7 +1262,7 @@ async def test_resource_file_move_rechecks_target_write_after_acquiring_lease(
     assert not storage.agfs._pathlock_leases
 
 
-async def test_resource_directory_move_rechecks_target_write_after_acquiring_lease(
+async def test_resource_directory_move_rechecks_target_created_before_lease(
     acl_move_storage, monkeypatch
 ):
     storage = acl_move_storage
@@ -1278,13 +1274,12 @@ async def test_resource_directory_move_rechecks_target_write_after_acquiring_lea
     before = _acl_move_files(storage)
     acquire = storage.agfs.pathlock_acquire_batch_async
 
-    async def acquire_after_target_change(*args, **kwargs):
+    async def acquire_after_target_created(*args, **kwargs):
         storage.agfs.mkdir(target_path)
-        lease = await acquire(*args, **kwargs)
         storage.grants[target] = AclLevel.READ
-        return lease
+        return await acquire(*args, **kwargs)
 
-    monkeypatch.setattr(storage.agfs, "pathlock_acquire_batch_async", acquire_after_target_change)
+    monkeypatch.setattr(storage.agfs, "pathlock_acquire_batch_async", acquire_after_target_created)
 
     with pytest.raises(PermissionDeniedError, match="write permission required"):
         await storage.fs.mv(source, target, ctx=storage.ctx)

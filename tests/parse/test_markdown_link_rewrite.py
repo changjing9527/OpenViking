@@ -704,7 +704,7 @@ class TestRewriteImageUris:
 
         return patch.object(image_rewrite_mod, "get_viking_fs", return_value=fake)
 
-    async def test_nested_mapping_consumed(self, request_context):
+    async def test_nested_mapping_consumed(self):
         from openviking.parse.image_rewrite import rewrite_image_uris
 
         root = "viking://resources/res"
@@ -718,7 +718,7 @@ class TestRewriteImageUris:
         }
 
         with self._patched(fake):
-            stats = await rewrite_image_uris(root, ctx=request_context, lease_ref=None)
+            stats = await rewrite_image_uris(root, lease_ref=None)
 
         assert stats == {"files_processed": 1, "references_rewritten": 1}
         assert _decode(fake.files[f"{root}/index/index.md"]) == (f"![p]({root}/index/logo.png)")

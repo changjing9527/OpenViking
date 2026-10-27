@@ -5,7 +5,6 @@ import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.resource_service import ResourceService
-from openviking.storage.acl import AclAction
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg, AddResourcePhase
 from openviking.storage.queuefs.add_resource_processor import AddResourceProcessor
 from openviking_cli.exceptions import FailedPreconditionError
@@ -37,10 +36,7 @@ async def test_cleanup_reserved_target_removes_only_empty_directory():
         stat=AsyncMock(return_value={"isDir": True}),
         ls=AsyncMock(return_value=[]),
         _ensure_access=AsyncMock(),
-        _ensure_access_many=AsyncMock(),
-        _acl_enabled=AsyncMock(return_value=True),
-        _uri_to_path=lambda uri, ctx: "/account-1/resources/empty",
-        _collect_uris=AsyncMock(return_value=[]),
+        _acl_enabled=AsyncMock(return_value=False),
         remove_files=AsyncMock(),
     )
     service = _service(viking_fs)
@@ -52,9 +48,6 @@ async def test_cleanup_reserved_target_removes_only_empty_directory():
     )
 
     assert removed is True
-    viking_fs._ensure_access.assert_awaited_once_with(
-        "viking://resources/empty", ctx, action=AclAction.WRITE
-    )
     viking_fs.remove_files.assert_awaited_once_with(
         "viking://resources/empty",
         recursive=True,

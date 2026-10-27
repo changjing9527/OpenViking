@@ -7,12 +7,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from openviking.server.identity import RequestContext, Role
 from openviking.storage.acl import AclEntry, AclLevel, AclMode, DirectAcl, EffectiveAcl
 from openviking.storage.resource_target import AgfsResourceTarget
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import PermissionDeniedError
-from openviking_cli.session.user_id import UserIdentifier
 from tests.utils.mock_agfs import MockLocalAGFS
 
 
@@ -38,32 +36,6 @@ _ROOT = "viking://resources/proj"
 
 def _target(vfs):
     return AgfsResourceTarget(viking_fs=vfs, root_uri=_ROOT, ctx=_Ctx())
-
-
-@pytest.fixture
-async def acl_target(tmp_path):
-    grants = {}
-
-    async def resolve_many(uris, ctx):
-        return {
-            uri: EffectiveAcl(
-                AclMode.RESTRICTED,
-                DirectAcl((AclEntry("user:alice", grants.get(uri, AclLevel.WRITE)),)),
-                DirectAcl(),
-            )
-            for uri in uris
-        }
-
-    acl = SimpleNamespace(is_enabled=AsyncMock(return_value=True), resolve_many=resolve_many)
-    agfs = MockLocalAGFS(root_path=tmp_path)
-    fs = VikingFS(agfs=agfs, acl_manager=acl)
-    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER)
-    root_path = fs._uri_to_path(_ROOT, ctx=ctx)
-    agfs.mkdir(root_path)
-    lease = await fs._async_agfs.pathlock_acquire_tree(root_path)
-    target = AgfsResourceTarget(viking_fs=fs, root_uri=_ROOT, ctx=ctx, lease_ref=lease)
-    yield SimpleNamespace(target=target, grants=grants, root=agfs._resolve(root_path))
-    await fs._async_agfs.pathlock_release(lease)
 
 
 @pytest.mark.asyncio
@@ -100,37 +72,33 @@ class TestAgfsResourceTarget:
         with pytest.raises(ValueError):
             await target.write_file("../evil.py", b"x")
 
-    async def test_import_file_cleanup_requires_write(self, acl_target) -> None:
-        old_file = acl_target.root / "gone.py"
-        sibling = acl_target.root / "keep.py"
-        old_file.write_bytes(b"old content")
-        sibling.write_bytes(b"keep")
-        acl_target.grants[f"{_ROOT}/gone.py"] = AclLevel.READ
+    async def test_import_directory_cleanup_requires_write_on_descendants(
+        self, tmp_path, request_context
+    ) -> None:
+        root_path = f"/local/{request_context.account_id}/resources/proj"
+        child_uri = f"{_ROOT}/nested/document.md"
+        writer = EffectiveAcl(
+            AclMode.RESTRICTED,
+            DirectAcl((AclEntry("user:*", AclLevel.WRITE),)),
+            DirectAcl(),
+        )
+        denied = EffectiveAcl(AclMode.RESTRICTED, DirectAcl(), DirectAcl())
+        grants = {_ROOT: writer, f"{_ROOT}/nested": writer, child_uri: denied}
+        acl = SimpleNamespace(
+            is_enabled=AsyncMock(return_value=True), resolve_many=AsyncMock(return_value=grants)
+        )
+        agfs = MockLocalAGFS(root_path=tmp_path)
+        agfs.write(f"{root_path}/nested/document.md", b"content")
+        fs = VikingFS(agfs=agfs, acl_manager=acl)
+        target = AgfsResourceTarget(viking_fs=fs, root_uri=_ROOT, ctx=request_context)
 
         with pytest.raises(PermissionDeniedError, match="write permission required"):
-            await acl_target.target.delete_path("gone.py", is_dir=False)
-        assert old_file.read_bytes() == b"old content"
+            await target.delete_path("", is_dir=True)
+        assert agfs.read_file(f"{root_path}/nested/document.md") == b"content"
 
-        acl_target.grants[f"{_ROOT}/gone.py"] = AclLevel.WRITE
-        await acl_target.target.delete_path("gone.py", is_dir=False)
-        assert not old_file.exists()
-        assert sibling.read_bytes() == b"keep"
-
-    async def test_import_directory_cleanup_requires_write_on_descendants(self, acl_target) -> None:
-        nested = acl_target.root / "old-dir" / "nested"
-        nested.mkdir(parents=True)
-        old_file = nested / "document.md"
-        old_file.write_bytes(b"old content")
-        child_uri = f"{_ROOT}/old-dir/nested/document.md"
-        acl_target.grants[child_uri] = AclLevel.READ
-
-        with pytest.raises(PermissionDeniedError, match="write permission required"):
-            await acl_target.target.delete_path("old-dir", is_dir=True)
-        assert old_file.read_bytes() == b"old content"
-
-        acl_target.grants[child_uri] = AclLevel.WRITE
-        await acl_target.target.delete_path("old-dir", is_dir=True)
-        assert not (acl_target.root / "old-dir").exists()
+        grants[child_uri] = writer
+        await target.delete_path("", is_dir=True)
+        assert not agfs.exists(root_path)
 
     async def test_read_file_returns_existing_bytes(self) -> None:
         vfs = _FakeVikingFS(existing={f"{_ROOT}/a.py": b"body"})

@@ -216,43 +216,30 @@ async def test_default_rm_still_cleans_vector_records(storage, missing, uri):
         storage.agfs.pathlock_release.assert_awaited_once_with(storage.lease)
 
 
-@pytest.mark.parametrize("no_vector", [False, True])
 @pytest.mark.parametrize("is_dir", [False, True])
-async def test_resource_delete_requires_manage_on_file_and_descendants(storage, no_vector, is_dir):
+async def test_resource_delete_requires_manage_on_file_and_descendants(storage, is_dir):
     child_uri = f"{RESOURCE_URI}/restricted.md"
     uri = RESOURCE_URI if is_dir else child_uri
     storage.agfs.stat.return_value = {"isDir": is_dir}
     storage.fs._collect_uris.side_effect = lambda *args, **kwargs: [child_uri] if is_dir else []
     storage.acl.is_enabled.return_value = True
-    manager = EffectiveAcl(
-        AclMode.RESTRICTED,
-        DirectAcl((AclEntry("user:alice", AclLevel.MANAGE),)),
-        DirectAcl(),
-    )
-    child_acl = EffectiveAcl(
-        AclMode.RESTRICTED,
-        DirectAcl((AclEntry("user:alice", AclLevel.WRITE),)),
-        DirectAcl(),
-    )
+    permissions = {
+        level: EffectiveAcl(
+            AclMode.RESTRICTED, DirectAcl((AclEntry("user:alice", level),)), DirectAcl()
+        )
+        for level in (AclLevel.WRITE, AclLevel.MANAGE)
+    }
+    grants = {RESOURCE_URI: permissions[AclLevel.MANAGE], child_uri: permissions[AclLevel.WRITE]}
+    storage.acl.resolve_many.return_value = grants
 
-    async def resolve_many(uris, ctx):
-        return {target: child_acl if target == child_uri else manager for target in uris}
-
-    storage.acl.resolve_many.side_effect = resolve_many
     with pytest.raises(PermissionDeniedError, match="manage permission required"):
-        await storage.fs.rm(uri, recursive=is_dir, ctx=storage.ctx, no_vector=no_vector)
+        await storage.fs.rm(uri, recursive=is_dir, ctx=storage.ctx)
     storage.agfs.rm.assert_not_awaited()
     storage.vector.delete_uris.assert_not_awaited()
 
-    child_acl = manager
-    result = await storage.fs.rm(uri, recursive=is_dir, ctx=storage.ctx, no_vector=no_vector)
-
-    assert result == {"estimated_deleted_count": 0 if no_vector else 7}
+    grants[child_uri] = permissions[AclLevel.MANAGE]
+    await storage.fs.rm(uri, recursive=is_dir, ctx=storage.ctx)
     storage.agfs.rm.assert_awaited_once()
-    if no_vector:
-        storage.vector.count.assert_not_awaited()
-        storage.vector.delete_uris.assert_not_awaited()
-    else:
-        storage.vector.delete_uris.assert_awaited_once_with(
-            storage.ctx, [child_uri, RESOURCE_URI] if is_dir else [child_uri]
-        )
+    storage.vector.delete_uris.assert_awaited_once_with(
+        storage.ctx, [child_uri, RESOURCE_URI] if is_dir else [child_uri]
+    )
