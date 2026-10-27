@@ -5,7 +5,6 @@
 import asyncio
 import math
 import uuid
-from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Union
 
@@ -241,9 +240,7 @@ class _OpsMixin:
         """
         from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 
-        guard_ctx = replace(self._ctx_or_default(ctx), bypass_acl=True)
-        await self._ensure_access(uri, guard_ctx, action=AclAction.MANAGE)
-        await self._ensure_removal_access(uri, ctx)
+        await self._ensure_access(uri, ctx, action=AclAction.MANAGE)
         path = self._uri_to_path(uri, ctx=ctx)
         target_uri = self._path_to_uri(path, ctx=ctx)
 
@@ -262,7 +259,7 @@ class _OpsMixin:
 
         async def _finish_missing_delete() -> Dict[str, Any]:
             """Clean orphan index records for an idempotent delete."""
-            await self._ensure_removal_access(target_uri, ctx)
+            await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
             if no_vector:
                 return {"estimated_deleted_count": 0}
             uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
@@ -283,12 +280,9 @@ class _OpsMixin:
                 if mapped is not None:
                     raise mapped from exc
                 raise
-            if recursive:
-                await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
             return await _finish_missing_delete()
 
         if is_dir:
-            await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
             if not recursive:
                 raise InvalidArgumentError(
                     f"Cannot remove directory without --recursive: {uri}",
@@ -311,7 +305,7 @@ class _OpsMixin:
                 raise ResourceBusyError(f"Resource is being processed: {uri}", uri=uri)
 
         try:
-            await self._ensure_removal_access(target_uri, ctx)
+            await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
             if lease_ref is None and lease is not None:
                 try:
                     await self._async_agfs.stat(path)
@@ -558,10 +552,7 @@ class _OpsMixin:
             if bool(stat.get("isDir", False)) != directory:
                 raise InvalidArgumentError(f"transfer source type changed: {source}")
             if move:
-                if directory or source != old_uri:
-                    await self._ensure_access(source, ctx, action=AclAction.MANAGE)
-                else:
-                    await self._ensure_removal_access(source, ctx)
+                await self._ensure_access(source, ctx, action=AclAction.MANAGE)
                 await self._ensure_move_target_access(target, ctx)
             else:
                 await self._ensure_copy_source_access(source, recursive=directory, ctx=ctx)
@@ -585,19 +576,6 @@ class _OpsMixin:
 
         await visit(old_uri, new_uri, is_dir)
         return source_uris
-
-    async def _ensure_removal_access(
-        self,
-        uri: str,
-        ctx: Optional[RequestContext],
-    ) -> None:
-        """Require manage to delete or move shared resources when ACL is enabled."""
-        action = (
-            AclAction.MANAGE
-            if is_acl_uri(uri) and await self._acl_enabled(ctx)
-            else AclAction.WRITE
-        )
-        await self._ensure_access(uri, ctx, action=action)
 
     async def _ensure_move_target_access(
         self,
@@ -769,9 +747,7 @@ class _OpsMixin:
         new_uri = self._normalize_transfer_uri(new_uri)
         acl_manager = self.acl_manager
         acl_enabled = await self._acl_enabled(ctx)
-        guard_ctx = replace(self._ctx_or_default(ctx), bypass_acl=True)
-        await self._ensure_access(old_uri, guard_ctx, action=AclAction.MANAGE)
-        await self._ensure_removal_access(old_uri, ctx)
+        await self._ensure_access(old_uri, ctx, action=AclAction.MANAGE)
         await self._ensure_move_target_access(new_uri, ctx)
         old_scope = old_uri.rstrip("/")
         new_scope = new_uri.rstrip("/")
@@ -796,8 +772,6 @@ class _OpsMixin:
                 raise
             raise FileNotFoundError(f"mv source not found: {old_uri}") from exc
 
-        if is_dir:
-            await self._ensure_access(old_uri, ctx, action=AclAction.MANAGE)
         await self._ensure_transfer_parent_directory(new_path, new_uri, operation="mv")
         await self._ensure_transfer_target_type(new_path, new_uri, is_dir=is_dir)
 
@@ -2505,7 +2479,7 @@ class _OpsMixin:
         ctx: Optional[RequestContext] = None,
     ) -> None:
         """Move file."""
-        await self._ensure_removal_access(from_uri, ctx)
+        await self._ensure_access(from_uri, ctx, action=AclAction.MANAGE)
         await self._ensure_move_target_access(to_uri, ctx)
         from_path = self._uri_to_path(from_uri, ctx=ctx)
         to_path = self._uri_to_path(to_uri, ctx=ctx)
@@ -2514,7 +2488,7 @@ class _OpsMixin:
             [{"path": from_path, "kind": "exact"}, {"path": to_path, "kind": "exact"}]
         )
         try:
-            await self._ensure_removal_access(from_uri, ctx)
+            await self._ensure_access(from_uri, ctx, action=AclAction.MANAGE)
             await self._ensure_move_target_access(to_uri, ctx)
             content = await self.read_file_bytes(from_uri, ctx=ctx)
             await self.write_file_bytes(to_uri, content, ctx=ctx, lease_ref=lease)

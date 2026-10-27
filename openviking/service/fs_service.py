@@ -1210,7 +1210,7 @@ class FSService:
             return
         if move:
             await versions.before_move(from_uri.rstrip("/"), to_uri.rstrip("/"), ctx)
-            await viking_fs._ensure_removal_access(from_uri, ctx)
+            await viking_fs._ensure_access(from_uri, ctx, action=AclAction.MANAGE)
             await viking_fs._ensure_move_target_access(to_uri, ctx)
         else:
             await viking_fs._ensure_copy_source_access(from_uri, recursive=recursive, ctx=ctx)
@@ -1221,8 +1221,6 @@ class FSService:
         is_dir = (await viking_fs.stat(from_uri, ctx=ctx, skip_count=True)).get("isDir", False)
         if is_dir and not recursive:
             raise InvalidArgumentError(f"Cannot copy directory without --recursive: {from_uri}")
-        if move and is_dir:
-            await viking_fs._ensure_access(from_uri, ctx, action=AclAction.MANAGE)
         if not is_dir and to_uri.rstrip("/") != to_uri:
             raise InvalidArgumentError(
                 f"Transfer destination for a file must include the target file name: {to_uri}"
