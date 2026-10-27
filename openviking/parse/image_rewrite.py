@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 from openviking.server.identity import RequestContext
-from openviking.storage.acl import AclAction
 from openviking.storage.viking_fs import get_viking_fs
 from openviking_cli.utils import get_logger
 
@@ -277,7 +276,7 @@ async def rewrite_image_uris(
         ctx: Optional request context for permissions
         lease_ref: Optional lease reference held by the caller. When the caller
             already owns a TREE lock over *root_uri*, forwarding it lets the
-            cleanup ``rm`` reuse that lock instead of conflicting with it.
+            cleanup ``remove_files`` reuse that lock instead of conflicting with it.
 
     Returns:
         Dict with ``files_processed`` and ``references_rewritten`` counts.
@@ -350,13 +349,8 @@ async def rewrite_image_uris(
     # Clean up mapping sidecars — no longer needed after rewrite
     for map_dir in mappings_by_dir:
         try:
-            mapping_uri = f"{map_dir}/{IMAGE_MAPPINGS_FILENAME}"
-            if ctx is not None:
-                # Consuming generated import metadata remains part of writing
-                # the import, even when deleting user content requires manage.
-                await viking_fs._ensure_access(mapping_uri, ctx, action=AclAction.WRITE)
             await viking_fs.remove_files(
-                mapping_uri,
+                f"{map_dir}/{IMAGE_MAPPINGS_FILENAME}",
                 ctx=ctx,
                 lease_ref=lease_ref,
             )

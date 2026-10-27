@@ -3,19 +3,13 @@
 """Tests for MarkdownParser relative-link rewriting on ingest."""
 
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.directory import DirectoryParser
 from openviking.parse.parsers.markdown import MarkdownParser, _RewriteContext
-from openviking.server.identity import RequestContext, Role
-from openviking.storage.acl import AclEntry, AclLevel, AclMode, DirectAcl, EffectiveAcl
-from openviking.storage.viking_fs import VikingFS
-from openviking_cli.session.user_id import UserIdentifier
-from tests.utils.mock_agfs import MockLocalAGFS
 
 
 class TestRewriteRelativeLinks:
@@ -710,41 +704,25 @@ class TestRewriteImageUris:
 
         return patch.object(image_rewrite_mod, "get_viking_fs", return_value=fake)
 
-    async def test_nested_mapping_consumed_with_write_permission(self, tmp_path):
+    async def test_nested_mapping_consumed(self, request_context):
         from openviking.parse.image_rewrite import rewrite_image_uris
 
         root = "viking://resources/res"
-        ctx = RequestContext(user=UserIdentifier("account", "alice"), role=Role.USER)
-        writer = EffectiveAcl(
-            AclMode.RESTRICTED,
-            DirectAcl((AclEntry("user:alice", AclLevel.WRITE),)),
-            DirectAcl(),
-        )
-        acl = SimpleNamespace(
-            is_enabled=AsyncMock(return_value=True),
-            resolve_many=AsyncMock(side_effect=lambda uris, ctx: dict.fromkeys(uris, writer)),
-        )
-        agfs = MockLocalAGFS(root_path=tmp_path)
-        fs = VikingFS(agfs=agfs, acl_manager=acl)
-        files = {
-            f"{root}/index/index.md": b"![p](./assets/logo.png)",
+        fake = FakeVikingFS()
+        fake.files = {
+            f"{root}/index/index.md": "![p](./assets/logo.png)".encode(),
             f"{root}/index/logo.png": b"img",
             f"{root}/index/.image_mappings.json": (
-                b'{"index.md": {"./assets/logo.png": "logo.png"}}'
+                '{"index.md": {"./assets/logo.png": "logo.png"}}'.encode()
             ),
         }
-        for uri, content in files.items():
-            agfs.write(fs._uri_to_path(uri, ctx=ctx), content)
 
-        with self._patched(fs):
-            stats = await rewrite_image_uris(root, ctx=ctx)
+        with self._patched(fake):
+            stats = await rewrite_image_uris(root, ctx=request_context, lease_ref=None)
 
         assert stats == {"files_processed": 1, "references_rewritten": 1}
-        assert await fs.read_file(f"{root}/index/index.md", ctx=ctx) == (
-            f"![p]({root}/index/logo.png)"
-        )
-        assert await fs.read_file_bytes(f"{root}/index/logo.png", ctx=ctx) == b"img"
-        assert not await fs.exists(f"{root}/index/.image_mappings.json", ctx=ctx)
+        assert _decode(fake.files[f"{root}/index/index.md"]) == (f"![p]({root}/index/logo.png)")
+        assert f"{root}/index/.image_mappings.json" not in fake.files
 
     async def test_split_doc_mapping_keys_resolved(self):
         # Keys produced for a split document are paths relative to the doc root
